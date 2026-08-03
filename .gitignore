@@ -1,0 +1,8 @@
+# settings.json backups the installer writes, in case anyone runs it in-tree
+*.backup-*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
