@@ -10,8 +10,8 @@ twenty minutes re-explaining your own project to it.
 ## Install
 
 ```bash
-git clone <this-repo> claude-starter-kit
-cd claude-starter-kit
+git clone https://github.com/hyamie/claude-code-starter-kit.git
+cd claude-code-starter-kit
 ./install.sh
 ```
 
