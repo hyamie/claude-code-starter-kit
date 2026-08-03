@@ -160,3 +160,8 @@ rm ~/.claude/hooks/{session-clock,session-age-warning,context-size-warning,sessi
 rm ~/.claude/commands/{continue,done}.md
 rm -rf ~/.claude/.cache/starter-kit
 ```
+
+## License
+
+Public domain, via [The Unlicense](https://unlicense.org/). Take it, change it,
+ship it, sell it. No attribution required, no strings.
