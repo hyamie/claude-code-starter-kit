@@ -1,0 +1,189 @@
+name: gitleaks
+
+# Fleet FORWARD gate for committed secrets.
+#
+# WHAT IT GATES: only the commits a push or pull request introduces. Not full history.
+#
+# That is deliberate, not a shortcut. 29 distinct live credentials already sit in the
+# history of 8 private repos, and rotation was ratified as ACCEPTED RISK on 2026-08-24
+# (global/context/decisions.jsonl -> committed-live-credentials-accepted-not-rotated).
+# A full-history scan would be red forever on those repos, and a permanently red gate
+# is a disabled gate. This one is green today on every repo and goes red the moment a
+# NEW secret is added, which is the only remaining lever once rotation is off the table.
+#
+# HARDENING, including one thing that does NOT work:
+#   - actions/checkout pinned to a commit SHA.
+#   - gitleaks pinned to a version AND checksum-verified before it runs.
+#   - the scan config is written outside the tree and passed with --config, which is
+#     precedence 1, so a committed .gitleaks.toml allowlist cannot weaken the scan.
+#   - MEASURED 2026-08-24: `--gitleaks-ignore-path /dev/null` does NOT stop gitleaks
+#     honouring a committed .gitleaksignore. Reproduced on BOTH 8.18.4 and 8.30.1: a
+#     repo that commits its own finding fingerprint scans clean with the flag set. The
+#     flag is decoration. The real control is removing the file from the CI checkout,
+#     which is what the "Neutralise" step below does. Do not replace that step with the
+#     flag.
+#
+# THE ONE SANCTIONED ESCAPE HATCH is an inline `gitleaks:allow` comment on the offending
+# line. That is deliberate and it is the only suppression left open. The two file-level
+# ones are closed above because they are invisible in review and can wildcard whole
+# paths; an inline allow sits on the line itself, so a human reading the diff sees both
+# the value and the decision to permit it. Passing --ignore-gitleaks-allow would close it
+# too and leave a false positive with no remedy short of editing the fleet template, which
+# across 84 repos is how a gate gets deleted rather than fixed.
+#
+# VERSION: gitleaks 8.30.1, and the subcommand is `git`, not `detect`. 8.30.x removed
+# `detect` and `protect` entirely, so a copy of this workflow that still says `detect`
+# fails to run rather than silently scanning nothing. 8.18.4 also cannot see
+# curl-auth-user or curl-auth-header at all (measured against a planted fixture with an
+# asserted commit count), which was 31 of the 50 high-confidence findings in the fleet
+# history scan.
+#
+# Source of truth: ~/claude-env/global/templates/workflows/gitleaks.yml
+# Installed by:    ~/claude-env/scripts/rollout-secret-gate.sh
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on pull requests ONLY. A PR always re-scans base..head, so a
+  # cancelled PR run loses no coverage. A push run does not: push N scans before(N)..after(N),
+  # so cancelling it when push N+1 arrives means the commits from push N are never scanned by
+  # anything. Caught in the pilot, where a branch-creation run and a commit run landed one
+  # second apart and the first was cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gitleaks:
+    name: forward gate
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      # Public release checksum, published by the vendor. Not a secret.
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history: both ends of the scan range must be present locally, and a
+          # shallow clone silently loses the base, which reads as an empty range.
+          fetch-depth: 0
+
+      - name: Neutralise in-tree scanner config
+        run: |
+          set -euo pipefail
+          found=0
+          for f in .gitleaksignore .gitleaks.toml; do
+            if [ -e "$f" ]; then
+              echo "::warning title=In-tree gitleaks config ignored::${f} is present in this repo and is being removed from the CI checkout only. The forward gate scans with the fleet config so that a commit cannot allowlist its own secret. Your local scans are unaffected."
+              rm -rf -- "$f"
+              found=$((found + 1))
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "no in-tree scanner config present"
+          fi
+
+      - name: Write fleet scan config
+        run: |
+          set -euo pipefail
+          # Lives outside the repo tree on purpose. --config is precedence 1 and beats
+          # the tree's own .gitleaks.toml (precedence 4).
+          printf '%s\n' \
+            'title = "fleet forward gate"' \
+            '[extend]' \
+            'useDefault = true' \
+            > "${RUNNER_TEMP}/gitleaks-fleet.toml"
+          cat "${RUNNER_TEMP}/gitleaks-fleet.toml"
+
+      - name: Install gitleaks (pinned and checksum-verified)
+        run: |
+          set -euo pipefail
+          tarball="${RUNNER_TEMP}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f "$tarball" gitleaks
+          gitleaks version
+
+      - name: Scan the commits this event introduces
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # === forward-gate range logic (extracted and exercised by
+          # === tests/workflows/test_secret_gate_template.py; keep it self-contained)
+          set -euo pipefail
+
+          ZERO="0000000000000000000000000000000000000000"
+
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target)
+              BASE="${PR_BASE_SHA:-}"
+              HEAD="${PR_HEAD_SHA:-}"
+              ;;
+            push)
+              BASE="${PUSH_BEFORE:-}"
+              HEAD="${GITHUB_SHA:-}"
+              ;;
+            *)
+              echo "::error title=Unsupported event::'${EVENT_NAME}' carries no base/head pair, so no scan range can be derived. Refusing to report a result."
+              exit 1
+              ;;
+          esac
+
+          # The PR checkout is refs/pull/N/merge, so head.sha is usually but not always
+          # reachable. Fall back to the checked-out commit rather than failing.
+          if [ -z "$HEAD" ] || ! git cat-file -e "${HEAD}^{commit}" 2>/dev/null; then
+            echo "head '${HEAD:-<empty>}' is not present locally; using GITHUB_SHA"
+            HEAD="${GITHUB_SHA}"
+          fi
+          if ! git cat-file -e "${HEAD}^{commit}" 2>/dev/null; then
+            echo "::error title=No scannable head::Neither the event head nor GITHUB_SHA resolves to a commit."
+            exit 1
+          fi
+
+          # A branch that did not exist before this push reports an all-zero base. The
+          # honest base is then the default branch, not the empty set.
+          if [ -z "$BASE" ] || [ "$BASE" = "$ZERO" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            if [ -n "${DEFAULT_BRANCH:-}" ] && git rev-parse --verify --quiet "origin/${DEFAULT_BRANCH}^{commit}" >/dev/null; then
+              echo "no usable base sha; falling back to origin/${DEFAULT_BRANCH}"
+              BASE="origin/${DEFAULT_BRANCH}"
+            else
+              echo "no usable base and no default-branch ref; scanning every ancestor of HEAD"
+              BASE=""
+            fi
+          fi
+
+          if [ -n "$BASE" ]; then
+            RANGE="${BASE}..${HEAD}"
+          else
+            RANGE="$HEAD"
+          fi
+
+          # Assert the denominator BEFORE evaluating findings. An unresolvable range must
+          # fail; an empty range must be stated out loud, never pass silently as "clean".
+          if ! COUNT="$(git rev-list --count "$RANGE" 2>/dev/null)"; then
+            echo "::error title=Unresolvable range::Could not resolve '${RANGE}'. Refusing to report a green scan over a range that was never evaluated."
+            exit 1
+          fi
+          echo "scan range: ${RANGE}  (${COUNT} commit(s))"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::notice title=Nothing to gate::This event introduced no new commits, so the forward gate had nothing to scan. This is not a clean-scan result."
+            exit 0
+          fi
+
+          gitleaks git . \
+            --log-opts "$RANGE" \
+            --config "${RUNNER_TEMP}/gitleaks-fleet.toml" \
+            --no-banner \
+            --redact \
+            --verbose
