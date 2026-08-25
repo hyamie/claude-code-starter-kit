@@ -43,6 +43,21 @@ name: gitleaks
 
 on:
   push:
+    # RENDERED PER REPO. scripts/rollout-secret-gate.sh substitutes main with
+    # the repo's real default branch before writing this file, and REFUSES to write if the
+    # placeholder survives, because a workflow that triggers on a branch named
+    # "main" never runs and would report as installed while gating nothing.
+    #
+    # Why filter here rather than skip inside the job: a job-level `if` still publishes a
+    # check run, so a PR-branch push produced a SECOND check named `gitleaks` with
+    # conclusion `skipped` alongside the real one from the pull_request run. Measured live
+    # on agent-builder#1 with a planted credential: `gitleaks:FAILURE` completed at
+    # 02:05:54Z and `gitleaks:SKIPPED` at 02:05:11Z, two check runs, same name, same head
+    # sha. The real result won only because a skipped job finishes in ~2s and a real scan
+    # takes ~40s. Branch protection resolving duplicate names by recency means that gate
+    # depended on winning a race, and 7 fleet repos require a check named exactly
+    # `gitleaks`. Filtering the trigger means the second run never exists.
+    branches: ["main"]
   pull_request:
 
 permissions:
@@ -59,7 +74,16 @@ concurrency:
 
 jobs:
   gitleaks:
-    name: forward gate
+    # THE JOB NAME IS LOAD-BEARING, do not make it more descriptive. It becomes the check
+    # name, and 7 repos already carry an active `enterprise-hardening-default-branch`
+    # ruleset whose required_status_checks names `gitleaks` (charger-work, claude-pm,
+    # cook-law-email, fincen-reforms, hds-agents, kcs-crm, koby-paperclip; measured
+    # 2026-08-24, and zero repos require any other name). A job called anything else
+    # produces no `gitleaks` check, the required check never reports, and every PR on
+    # those repos blocks forever. Caught on charger-work#25 and claude-pm#102, which sat
+    # BLOCKED with all six checks green.
+    name: gitleaks
+
     runs-on: ubuntu-latest
     env:
       GITLEAKS_VERSION: "8.30.1"
