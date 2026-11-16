@@ -4,12 +4,14 @@ name: gitleaks
 #
 # WHAT IT GATES: only the commits a push or pull request introduces. Not full history.
 #
-# That is deliberate, not a shortcut. 29 distinct live credentials already sit in the
-# history of 8 private repos, and rotation was ratified as ACCEPTED RISK on 2026-08-24
-# (global/context/decisions.jsonl -> committed-live-credentials-accepted-not-rotated).
-# A full-history scan would be red forever on those repos, and a permanently red gate
-# is a disabled gate. This one is green today on every repo and goes red the moment a
-# NEW secret is added, which is the only remaining lever once rotation is off the table.
+# That is deliberate, not a shortcut: a full-history scan cannot go green on every repo,
+# and a permanently red gate is a disabled gate. This one goes red the moment a NEW
+# secret is added. The rationale lives in claude-env docs/secret-forward-gate-2026-08-24.md,
+# not here, because this file is copied into every repo the rollout touches.
+#
+# Opt-in: a repo that syncs a public upstream sets the repository variable
+# SECRET_GATE_UPSTREAM=owner/repo, and commits already on that upstream's default branch
+# are not scanned. The trust boundary is written up in the same doc.
 #
 # HARDENING, including one thing that does NOT work:
 #   - actions/checkout pinned to a commit SHA.
@@ -43,10 +45,12 @@ name: gitleaks
 
 on:
   push:
-    # RENDERED PER REPO. scripts/rollout-secret-gate.sh substitutes main with
-    # the repo's real default branch before writing this file, and REFUSES to write if the
-    # placeholder survives, because a workflow that triggers on a branch named
-    # "main" never runs and would report as installed while gating nothing.
+    # RENDERED PER REPO. scripts/rollout-secret-gate.sh substitutes the branch placeholder
+    # below with the repo's real default branch before writing this file, and REFUSES to
+    # write if the placeholder survives, because a workflow that triggers on a branch named
+    # after the placeholder never runs and would report as installed while gating nothing.
+    # (This comment deliberately does not spell the placeholder: the substitution is global,
+    # so spelling it here renders as a sentence about the real branch in every copy.)
     #
     # Why filter here rather than skip inside the job: a job-level `if` still publishes a
     # check run, so a PR-branch push produced a SECOND check named `gitleaks` with
@@ -59,17 +63,26 @@ on:
     # `gitleaks`. Filtering the trigger means the second run never exists.
     branches: ["main"]
   pull_request:
+  # A repo whose default branch is protected by a merge queue requires this check on the
+  # merge group's own commit; without this trigger the check never reports there and the
+  # queue holds every pull request until it times out. A repo with no queue never receives
+  # the event, so the trigger costs it nothing.
+  merge_group:
 
 permissions:
   contents: read
 
 concurrency:
-  group: gitleaks-${{ github.workflow }}-${{ github.ref }}
-  # Cancel superseded runs on pull requests ONLY. A PR always re-scans base..head, so a
-  # cancelled PR run loses no coverage. A push run does not: push N scans before(N)..after(N),
-  # so cancelling it when push N+1 arrives means the commits from push N are never scanned by
-  # anything. Caught in the pilot, where a branch-creation run and a commit run landed one
-  # second apart and the first was cancelled.
+  # Push runs get a group of their own (run_id); pull requests share one per ref.
+  # A push run must never be cancelled or replaced: push N scans before(N)..after(N), so if
+  # it is dropped when push N+1 arrives, the commits from push N are scanned by nothing.
+  # cancel-in-progress: false alone does NOT prevent that. A concurrency group holds one
+  # running and one pending run, and a newly queued run cancels the pending one, so with a
+  # per-ref group push 3 silently replaced push 2 behind a running push 1. Scans are
+  # read-only, so parallel push runs are safe. A PR always re-scans base..head, so
+  # cancelling a superseded PR run loses nothing. Caught first in the pilot (a branch
+  # creation and a commit one second apart), then in review of rakazo-hds#3 (queue replacement).
+  group: gitleaks-${{ github.workflow }}-${{ github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -84,18 +97,28 @@ jobs:
     # BLOCKED with all six checks green.
     name: gitleaks
 
-    runs-on: ubuntu-latest
+    # RUNNER_LIGHT is an optional repository (or organization) variable naming a runner for
+    # short jobs, such as a Blacksmith label. Unset, the scan runs on the GitHub-hosted runner,
+    # so a repo that never sets it is unchanged and deleting it is the whole rollback. The
+    # scan holds contents: read only, so routing it off the hosted runner grants nothing.
+    runs-on: ${{ vars.RUNNER_LIGHT || 'ubuntu-latest' }}
+    # A forward scan of a push or PR range takes well under a minute; the 360-minute default only
+    # ever buys a hung download billing for six hours.
+    timeout-minutes: 10
     env:
       GITLEAKS_VERSION: "8.30.1"
       # Public release checksum, published by the vendor. Not a secret.
       GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history: both ends of the scan range must be present locally, and a
           # shallow clone silently loses the base, which reads as an empty range.
           fetch-depth: 0
+          # The scan only reads history; nothing here pushes. Leaving the token in .git/config is
+          # the artipacked exposure zizmor flags, so do not persist it.
+          persist-credentials: false
 
       - name: Neutralise in-tree scanner config
         run: |
@@ -140,7 +163,14 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          # GitHub's own list of the commits a push introduced (capped at 2048). Read only
+          # when `before` cannot anchor a range; see the push-payload block below.
+          PUSH_COMMITS: ${{ toJSON(github.event.commits.*.id) }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # A repository variable, so no pull request can set it.
+          SECRET_GATE_UPSTREAM: ${{ vars.SECRET_GATE_UPSTREAM }}
         run: |
           # === forward-gate range logic (extracted and exercised by
           # === tests/workflows/test_secret_gate_template.py; keep it self-contained)
@@ -156,6 +186,12 @@ jobs:
             push)
               BASE="${PUSH_BEFORE:-}"
               HEAD="${GITHUB_SHA:-}"
+              ;;
+            merge_group)
+              # The commits the queue built on top of its base: this pull request's merge, and
+              # those of any entry queued ahead of it, which re-scanning only repeats.
+              BASE="${MERGE_GROUP_BASE_SHA:-}"
+              HEAD="${MERGE_GROUP_HEAD_SHA:-}"
               ;;
             *)
               echo "::error title=Unsupported event::'${EVENT_NAME}' carries no base/head pair, so no scan range can be derived. Refusing to report a result."
@@ -174,40 +210,148 @@ jobs:
             exit 1
           fi
 
-          # A branch that did not exist before this push reports an all-zero base. The
-          # honest base is then the default branch, not the empty set.
+          # A branch that did not exist before this push reports an all-zero base, and a
+          # force-push reports a `before` that is gone from the clone (persist-credentials
+          # is off, so it cannot be fetched). The honest base is then the default branch,
+          # not the empty set, UNLESS the default branch already contains HEAD. That is
+          # every push this workflow sees, because the push trigger is filtered to the
+          # default branch and checkout fetched it: origin/<default>..HEAD would be empty
+          # and a push that introduced commits would read as "Nothing to gate". There the
+          # push payload's commit list is the range: exactly what the push introduced,
+          # never the older history this gate is designed not to re-scan.
+          USE_PAYLOAD=false
+          PAYLOAD_IDS=()
+          DEFAULT_REF=""
+          if [ -n "${DEFAULT_BRANCH:-}" ] && git rev-parse --verify --quiet "origin/${DEFAULT_BRANCH}^{commit}" >/dev/null; then
+            DEFAULT_REF="origin/${DEFAULT_BRANCH}"
+          fi
           if [ -z "$BASE" ] || [ "$BASE" = "$ZERO" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            if [ -n "${DEFAULT_BRANCH:-}" ] && git rev-parse --verify --quiet "origin/${DEFAULT_BRANCH}^{commit}" >/dev/null; then
-              echo "no usable base sha; falling back to origin/${DEFAULT_BRANCH}"
-              BASE="origin/${DEFAULT_BRANCH}"
+            if [ "$EVENT_NAME" = "push" ] && [ -n "$DEFAULT_REF" ] && git merge-base --is-ancestor "$HEAD" "$DEFAULT_REF"; then
+              # Validate positively: a JSON array of 40-hex commit ids, or refuse. A null,
+              # empty or reshaped payload must not read as "this push introduced nothing".
+              if ! jq -e 'type == "array" and all(.[]; type == "string" and test("^[0-9a-f]{40}$"))' \
+                  <<<"${PUSH_COMMITS:-}" >/dev/null 2>&1; then
+                echo "::error title=Unreadable push payload::The push payload's commit list is not an array of commit ids, so what this push introduced is unknown. Refusing to report a result."
+                exit 1
+              fi
+              mapfile -t PAYLOAD_IDS < <(jq -r '.[]' <<<"${PUSH_COMMITS}")
+              # GitHub truncates the list at 2048. A truncated list is a sample, and a
+              # green over a sample is the failure this gate exists to refuse. Checked on
+              # the raw list, before duplicates are dropped.
+              if [ "${#PAYLOAD_IDS[@]}" -ge 2048 ]; then
+                echo "::error title=Push payload truncated::The push lists 2048 commits, GitHub's cap, so the full set this push introduced is unknown. Refusing to report a result over a sample. Scan locally with: gitleaks git . --log-opts '<old-tip>..${HEAD}'"
+                exit 1
+              fi
+              if [ "${#PAYLOAD_IDS[@]}" -gt 0 ]; then
+                mapfile -t PAYLOAD_IDS < <(printf '%s\n' "${PAYLOAD_IDS[@]}" | sort -u)
+                MISSING="$(printf '%s\n' "${PAYLOAD_IDS[@]}" | git cat-file --batch-check='%(objectname) %(objecttype)' | awk '$2 != "commit" { print $1 }')"
+                if [ -n "$MISSING" ]; then
+                  echo "::error title=Payload commit missing::Listed by the push but not a commit in the checkout: ${MISSING//$'\n'/ }. Refusing to report a result."
+                  exit 1
+                fi
+              fi
+              # An empty list cannot prove the push introduced nothing, so scan the tip
+              # alone: one commit, still never the history before the push.
+              if [ "${#PAYLOAD_IDS[@]}" -eq 0 ]; then
+                PAYLOAD_IDS=("$(git rev-parse "${HEAD}^{commit}")")
+                echo "push payload lists no commits; scanning HEAD alone"
+              fi
+              echo "no usable base sha and ${DEFAULT_REF} already contains HEAD; using the push payload"
+              USE_PAYLOAD=true
+            elif [ -n "$DEFAULT_REF" ]; then
+              echo "no usable base sha; falling back to ${DEFAULT_REF}"
+              BASE="$DEFAULT_REF"
             else
               echo "no usable base and no default-branch ref; scanning every ancestor of HEAD"
               BASE=""
             fi
           fi
 
-          if [ -n "$BASE" ]; then
-            RANGE="${BASE}..${HEAD}"
+          if [ "$USE_PAYLOAD" = true ]; then
+            RANGE="push payload"
+            TOTAL="${#PAYLOAD_IDS[@]}"
           else
-            RANGE="$HEAD"
+            if [ -n "$BASE" ]; then
+              RANGE="${BASE}..${HEAD}"
+            else
+              RANGE="$HEAD"
+            fi
+            # Assert the denominator BEFORE evaluating findings. An unresolvable range must
+            # fail; an empty range must be stated out loud, never pass silently as "clean".
+            if ! TOTAL="$(git rev-list --count "$RANGE" 2>/dev/null)"; then
+              echo "::error title=Unresolvable range::Could not resolve '${RANGE}'. Refusing to report a green scan over a range that was never evaluated."
+              exit 1
+            fi
           fi
+          echo "scan range: ${RANGE}  (${TOTAL} commit(s))"
 
-          # Assert the denominator BEFORE evaluating findings. An unresolvable range must
-          # fail; an empty range must be stated out loud, never pass silently as "clean".
-          if ! COUNT="$(git rev-list --count "$RANGE" 2>/dev/null)"; then
-            echo "::error title=Unresolvable range::Could not resolve '${RANGE}'. Refusing to report a green scan over a range that was never evaluated."
-            exit 1
+          # Skip what is already on the upstream's DEFAULT branch; if it cannot be fetched,
+          # scan everything. Rationale: docs/secret-forward-gate-2026-08-24.md.
+          REVS=("$RANGE")
+          if [ -n "${SECRET_GATE_UPSTREAM:-}" ]; then
+            if ! [[ "$SECRET_GATE_UPSTREAM" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error title=Bad SECRET_GATE_UPSTREAM::Expected owner/repo, got '${SECRET_GATE_UPSTREAM}'. Refusing to guess which history to skip."
+              exit 1
+            fi
+            if git fetch --quiet --no-tags "https://github.com/${SECRET_GATE_UPSTREAM}.git" "+HEAD:refs/secret-gate/upstream"; then
+              if [ "$USE_PAYLOAD" = true ] && [ "${#PAYLOAD_IDS[@]}" -gt 0 ]; then
+                # Not `--no-walk <ids> --not <ref>`: measured, the negative ref turns
+                # --no-walk back into a walk and emits unlisted ancestors. Walk once
+                # instead, then keep only the listed commits that walk reached.
+                # Captured, not piped: set -e must see a rev-list failure, or an error
+                # here would empty the list and exit green without scanning.
+                WALKED="$(git rev-list "${PAYLOAD_IDS[@]}" --not refs/secret-gate/upstream)"
+                mapfile -t PAYLOAD_IDS < <(grep -Fx -f <(printf '%s\n' "${PAYLOAD_IDS[@]}") <<<"$WALKED" || true)
+              else
+                REVS+=(--not refs/secret-gate/upstream)
+              fi
+            else
+              echo "::warning title=Upstream unreachable::Could not fetch ${SECRET_GATE_UPSTREAM}; scanning the full range, upstream commits included."
+            fi
           fi
-          echo "scan range: ${RANGE}  (${COUNT} commit(s))"
+          if [ "$USE_PAYLOAD" = true ]; then
+            REVS=(--no-walk "${PAYLOAD_IDS[@]}")
+            COUNT="${#PAYLOAD_IDS[@]}"
+          else
+            COUNT="$(git rev-list --count "${REVS[@]}")"
+          fi
+          if [ "$COUNT" -ne "$TOTAL" ]; then
+            echo "$((TOTAL - COUNT)) of ${TOTAL} commit(s) are already on ${SECRET_GATE_UPSTREAM}'s default branch and are not scanned; ${COUNT} scanned"
+          fi
 
           if [ "$COUNT" -eq 0 ]; then
-            echo "::notice title=Nothing to gate::This event introduced no new commits, so the forward gate had nothing to scan. This is not a clean-scan result."
+            echo "::notice title=Nothing to gate::This event introduced no commits of its own, so the forward gate had nothing to scan. This is not a clean-scan result."
             exit 0
           fi
 
-          gitleaks git . \
-            --log-opts "$RANGE" \
-            --config "${RUNNER_TEMP}/gitleaks-fleet.toml" \
-            --no-banner \
-            --redact \
-            --verbose
+          # gitleaks exits 0, "no leaks found", when the git log it runs fails (measured on
+          # 8.30.1 with an option git rejects), and its "N commits scanned" line reads 0 even
+          # on a real scan, so it cannot be the check. Prove the exact log works first, over
+          # the whole range: a commit git cannot diff mid-walk fails here too. remerge needs
+          # git 2.36 or later.
+          scan() {
+            if ! git log -p -U0 "$@" >/dev/null; then
+              echo "::error title=git log failed::git could not produce the log this scan reads (git log -p -U0 $*). Refusing to report a result gitleaks never evaluated."
+              exit 1
+            fi
+            gitleaks git . \
+              --log-opts "$*" \
+              --config "${RUNNER_TEMP}/gitleaks-fleet.toml" \
+              --no-banner \
+              --redact \
+              --verbose
+          }
+
+          # git log prints no patch for a merge commit unless told how, so a secret typed in
+          # while resolving a conflict, or a file added to a merge, would pass unseen.
+          # remerge shows only what the merge itself introduced: first-parent or -m would
+          # re-show the merged-in side, which on an upstream sync is the delta the upstream
+          # skip exists to avoid. remerge shows nothing for a merge of three or more
+          # parents, so those get a first-parent pass of their own.
+          scan --diff-merges=remerge "${REVS[@]}"
+          OCTOPUS="$(git rev-list --min-parents=3 "${REVS[@]}")"
+          if [ -n "$OCTOPUS" ]; then
+            mapfile -t OCTOPUS_IDS <<<"$OCTOPUS"
+            echo "${#OCTOPUS_IDS[@]} merge(s) with three or more parents: scanning each against its first parent"
+            scan --diff-merges=first-parent --no-walk "${OCTOPUS_IDS[@]}"
+          fi
